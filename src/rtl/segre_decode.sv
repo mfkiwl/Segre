@@ -5,6 +5,7 @@ import segre_pkg::*;
 `define REG_RD 11:7
 `define FUNC_3 14:12
 `define FUNC_7 31:25
+`define REG_CSR 31:20
 
 module segre_decode(
     // Clock and Reset
@@ -12,6 +13,7 @@ module segre_decode(
     input logic rsn_i,
 
     input logic [WORD_SIZE-1:0] instr_i,
+    output opcode_e opcode_o,
 
     // Immediates
     output logic [WORD_SIZE-1:0] imm_u_type_o,
@@ -19,6 +21,7 @@ module segre_decode(
     output logic [WORD_SIZE-1:0] imm_s_type_o,
     output logic [WORD_SIZE-1:0] imm_j_type_o,
     output logic [WORD_SIZE-1:0] imm_b_type_o,
+    output logic [WORD_SIZE-1:0] zimm_rs1_type_o,
 
     // ALU
     output alu_opcode_e alu_opcode_o,
@@ -39,7 +42,15 @@ module segre_decode(
     output memop_data_type_e memop_type_o,
     output logic memop_sign_ext_o,
     output logic memop_rd_o,
-    output logic memop_wr_o
+    output logic memop_wr_o,
+
+    // Pipeline
+    output pipeline_e pipeline_o,
+    output logic is_branch_jal_o,
+
+    // CSR
+    output logic csr_access_o,
+    output logic [CSR_SIZE-1:0] csr_addr_o
 );
 
 opcode_e instr_opcode;
@@ -47,11 +58,12 @@ opcode_e alu_instr_opcode;
 
 logic illegal_ins;
 
-assign imm_i_type_o = { {20{instr_i[31]}}, instr_i[31:20] };
-assign imm_u_type_o = { instr_i[31:12], 12'b0 };
-assign imm_s_type_o = { {20{instr_i[31]}}, instr_i[31:25], instr_i[11:7] };
-assign imm_j_type_o = { {12{instr_i[31]}}, instr_i[19:12], instr_i[20], instr_i[30:21], 1'b0 };
-assign imm_b_type_o = { {19{instr_i[31]}}, instr_i[31], instr_i[7], instr_i[30:25], instr_i[11:8], 1'b0 };
+assign imm_i_type_o    = { {20{instr_i[31]}}, instr_i[31:20] };
+assign imm_u_type_o    = { instr_i[31:12], 12'b0 };
+assign imm_s_type_o    = { {20{instr_i[31]}}, instr_i[31:25], instr_i[11:7] };
+assign imm_j_type_o    = { {12{instr_i[31]}}, instr_i[19:12], instr_i[20], instr_i[30:21], 1'b0 };
+assign imm_b_type_o    = { {19{instr_i[31]}}, instr_i[31], instr_i[7], instr_i[30:25], instr_i[11:8], 1'b0 };
+assign zimm_rs1_type_o = { 27'b0, raddr_a_o }; // RS1 zero extended
 
 // Source registers
 assign raddr_a_o = instr_i[`REG_RS1];
@@ -59,6 +71,10 @@ assign raddr_b_o = instr_i[`REG_RS2];
 
 // Destination registers
 assign waddr_o = instr_i[`REG_RD];
+assign csr_addr_o = instr_i[`REG_CSR];
+
+// Opcode
+assign opcode_o = opcode_e'(instr_i[6:0]);
 
 /*****************
 *    DECODER     *
@@ -71,6 +87,8 @@ always_comb begin
     memop_sign_ext_o = 1'b0;
     memop_type_o     = WORD;
     instr_opcode     = opcode_e'(instr_i[6:0]);
+    csr_access_o     = 1'b0;
+    is_branch_jal_o  = 1'b0;
 
     unique case(instr_opcode)
 
@@ -108,12 +126,24 @@ always_comb begin
         end
         OPCODE_JAL: begin
             rf_we_o = 1'b1;
+            is_branch_jal_o = 1'b1;
         end
         OPCODE_JALR: begin
             rf_we_o = 1'b1;
+            is_branch_jal_o = 1'b1;
         end
         OPCODE_AUIPC: begin
             rf_we_o = 1'b1;
+        end
+        OPCODE_SYSTEM: begin
+            if (instr_i[`FUNC_3]) begin
+                // CSR OPERATIONS
+                csr_access_o = 1'b1;
+                rf_we_o = 1'b1;
+            end
+        end
+        OPCODE_BRANCH: begin
+            is_branch_jal_o = 1'b1;
         end
         default: begin
             if (rsn_i) begin
@@ -134,7 +164,8 @@ always_comb begin
     b_imm_mux_sel_o = IMM_B_U;
     br_b_mux_sel_o  = BR_B_REG;
     br_a_mux_sel_o  = BR_A_REG;
-    alu_instr_opcode      = opcode_e'(instr_i[6:0]);
+    alu_instr_opcode = opcode_e'(instr_i[6:0]);
+    pipeline_o      = EX_PIPELINE;
 
     unique case(alu_instr_opcode)
 
@@ -173,17 +204,29 @@ always_comb begin
         OPCODE_OP: begin
             src_a_mux_sel_o = ALU_A_REG;
             src_b_mux_sel_o = ALU_B_REG;
+
+            if (instr_i[`FUNC_7] == 7'b000_0001)
+                pipeline_o = RVM_PIPELINE;
+
             unique case ({instr_i[`FUNC_7], instr_i[`FUNC_3]})
-                {7'b000_0000, 3'b000}: alu_opcode_o = ALU_ADD;  // ADD
-                {7'b010_0000, 3'b000}: alu_opcode_o = ALU_SUB;  // SUB
-                {7'b000_0000, 3'b001}: alu_opcode_o = ALU_SLL;  // SLL
-                {7'b000_0000, 3'b010}: alu_opcode_o = ALU_SLT;  // SLT
-                {7'b000_0000, 3'b011}: alu_opcode_o = ALU_SLTU; // SLTU
-                {7'b000_0000, 3'b100}: alu_opcode_o = ALU_XOR;  // XOR
-                {7'b000_0000, 3'b101}: alu_opcode_o = ALU_SRL;  // SRL
-                {7'b010_0000, 3'b101}: alu_opcode_o = ALU_SRA;  // SRA
-                {7'b000_0000, 3'b110}: alu_opcode_o = ALU_OR;   // OR
-                {7'b000_0000, 3'b111}: alu_opcode_o = ALU_AND;  // AND
+                {7'b000_0000, 3'b000}: alu_opcode_o = ALU_ADD;    // ADD
+                {7'b010_0000, 3'b000}: alu_opcode_o = ALU_SUB;    // SUB
+                {7'b000_0000, 3'b001}: alu_opcode_o = ALU_SLL;    // SLL
+                {7'b000_0000, 3'b010}: alu_opcode_o = ALU_SLT;    // SLT
+                {7'b000_0000, 3'b011}: alu_opcode_o = ALU_SLTU;   // SLTU
+                {7'b000_0000, 3'b100}: alu_opcode_o = ALU_XOR;    // XOR
+                {7'b000_0000, 3'b101}: alu_opcode_o = ALU_SRL;    // SRL
+                {7'b010_0000, 3'b101}: alu_opcode_o = ALU_SRA;    // SRA
+                {7'b000_0000, 3'b110}: alu_opcode_o = ALU_OR;     // OR
+                {7'b000_0000, 3'b111}: alu_opcode_o = ALU_AND;    // AND
+                {7'b000_0001, 3'b000}: alu_opcode_o = ALU_MUL;    // MUL
+                {7'b000_0001, 3'b001}: alu_opcode_o = ALU_MULH;   // MUL
+                {7'b000_0001, 3'b010}: alu_opcode_o = ALU_MULHSU; // MULHSU
+                {7'b000_0001, 3'b011}: alu_opcode_o = ALU_MULHU;  // MULHU
+                {7'b000_0001, 3'b100}: alu_opcode_o = ALU_DIV;    // DIV
+                {7'b000_0001, 3'b101}: alu_opcode_o = ALU_DIVU;   // DIVU
+                {7'b000_0001, 3'b110}: alu_opcode_o = ALU_REM;    // REM
+                {7'b000_0001, 3'b111}: alu_opcode_o = ALU_REMU;   // REMU
                 default: ;
             endcase
         end
@@ -192,31 +235,33 @@ always_comb begin
             src_b_mux_sel_o = ALU_B_IMM;
             b_imm_mux_sel_o = IMM_B_I;
             alu_opcode_o = ALU_ADD;
+            pipeline_o = MEM_PIPELINE;
         end
         OPCODE_STORE: begin
             src_a_mux_sel_o = ALU_A_REG;
             src_b_mux_sel_o = ALU_B_IMM;
-            b_imm_mux_sel_o = IMM_B_I;
+            b_imm_mux_sel_o = IMM_B_S;
             alu_opcode_o = ALU_ADD;
+            pipeline_o = MEM_PIPELINE;
         end
         OPCODE_JAL: begin
             src_a_mux_sel_o = ALU_A_PC;
             src_b_mux_sel_o = ALU_B_IMM;
             br_a_mux_sel_o  = BR_A_PC;
             b_imm_mux_sel_o = IMM_B_J;
-            alu_opcode_o    = ALU_JAL; 
+            alu_opcode_o    = ALU_JAL;
         end
         OPCODE_JALR: begin
             src_a_mux_sel_o = ALU_A_REG;
             src_b_mux_sel_o = ALU_B_IMM;
             b_imm_mux_sel_o = IMM_B_I;
             br_a_mux_sel_o  = BR_A_PC;
-            alu_opcode_o    = ALU_JALR; 
+            alu_opcode_o    = ALU_JALR;
         end
         OPCODE_BRANCH: begin
             src_a_mux_sel_o = ALU_A_PC;
             src_b_mux_sel_o = ALU_B_IMM;
-            b_imm_mux_sel_o = IMM_B_I;
+            b_imm_mux_sel_o = IMM_B_B;
             br_a_mux_sel_o  = BR_A_REG;
             br_b_mux_sel_o  = BR_B_REG;
             unique case (instr_i[`FUNC_3])
@@ -234,6 +279,20 @@ always_comb begin
             src_b_mux_sel_o = ALU_B_IMM;
             b_imm_mux_sel_o = IMM_B_U;
             alu_opcode_o    = ALU_ADD;
+        end
+        OPCODE_SYSTEM: begin
+            // CSR OPERATIONS
+            if (instr_i[`FUNC_3] == 3'b001) begin
+                alu_opcode_o = ALU_PASS_B;
+                src_a_mux_sel_o = ALU_A_REG;
+                src_b_mux_sel_o = ALU_B_CSR;
+            end
+            else if (instr_i[`FUNC_3] == 3'b101) begin
+                alu_opcode_o = ALU_PASS_B;
+                a_imm_mux_sel_o = IMM_A_RS1;
+                src_a_mux_sel_o = ALU_A_IMM;
+                src_b_mux_sel_o = ALU_B_CSR;
+            end
         end
         default: ;
     endcase
